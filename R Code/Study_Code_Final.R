@@ -7,11 +7,14 @@ library(purrr)
 library(gridExtra)
 library(ggstats)
 library(sf)
+# devtools::install_github("UrbanInstitute/urbnmapr") 
 library(urbnmapr)
+library(ggsci)
+library(scales)
 
 ##### Part 1:Data Preparation #####
 # Download from: https://chpl.healthit.gov/
-path_prefix <- "/path/to/directory"
+path_prefix <- "/path/to/file/"
 df1 <- read.csv(paste0(path_prefix, "clinician-certified-technology-pi-2021-1.txt"), stringsAsFactors = FALSE)
 df2 <- read.csv(paste0(path_prefix, "clinician-certified-technology-pi-2021-2.txt"), stringsAsFactors = FALSE)
 df3 <- read.csv(paste0(path_prefix, "clinician-certified-technology-pi-2021-3.txt"), stringsAsFactors = FALSE)
@@ -27,6 +30,8 @@ distinct_combined_df <- combined_df %>%
   group_by(cehrt_id_clean, developer_name) %>%
   summarise()
 
+head(combined_df)
+
 # Group by cehrt_id_clean again and create a sequence for each distinct developer_name
 combined_df_prepared <- distinct_combined_df %>%
   group_by(cehrt_id_clean) %>%
@@ -39,11 +44,10 @@ combined_df_wide <- combined_df_prepared %>%
 
 # Read in QPAR file
 # Download from: https://qpp.cms.gov/resources/link/29eaf961-e9ab-44a8-8700-3aaccb9c4e27
-qpar2021 <- read.csv(paste0(path_prefix, "2021_puf_QPPAR-18260.csv"), stringsAsFactors = FALSE)
+qpar2021 <- read.csv(paste0(path_prefix, "2021_puf_QPPAR-18260 (1).csv"), stringsAsFactors = FALSE)
 
 # Replace spaces and dashes in column names with periods
 names(qpar2021) <- gsub(" ", ".", names(qpar2021))
-names(qpar2021) <- gsub("-", ".", names(qpar2021))
 
 # Perform the LEFT JOIN ON cehrt ID. Secondarily, create a flag for unsuccessful joins
 final_data <- qpar2021 %>%
@@ -91,7 +95,6 @@ subset_data <- subset_data[subset_data$engaged == "True", ]
 # Filter out data where a certified vendor could not be located. N=210,7281 -> N=209,351
 subset_data <- subset_data[subset_data$mismatch_flag == 0, ]
 
-
 # Define the state_to_subregion list for remaining analyses
 state_to_subregion <- list(
   ME='New England', NH='New England', VT='New England', MA='New England',
@@ -129,6 +132,10 @@ map_to_subregion <- function(state) {
 # Create Census subregion from states/territories
 subset_data$us_census_subregion <- sapply(subset_data$practice.state.or.us.territory, map_to_subregion)
 
+# Filter out data where the Census Division in U.S. Territories are there are no rural U.S. Territories in the dataset.
+# N=209,351 -> N 209,152.
+subset_data <- subset_data[subset_data$us_census_subregion != "U.S. Territories", ]
+
 ##### Part 3: Prepare variables for analysis #####
 
 # Convert columns with "TRUE" and "FALSE" values to 1 and 0
@@ -140,7 +147,7 @@ subset_data$rural.clinician <- ifelse(subset_data$rural.clinician == 0, "Urban",
                                       ifelse(subset_data$rural.clinician == 1, "Rural", NA))
 
 # Create a binary for whether a provider has a certified EHR
-subset_data$pi_cehrt_binary <-  ifelse(is.na(subset_data$developer_1), 0, 1)
+subset_data$pi_cehrt_binary <- ifelse(is.na(subset_data$developer_1) | trimws(subset_data$developer_1) == "", 0, 1)
 
 # Columns to check
 developer_columns <- c("developer_1", "developer_2", "developer_3",
@@ -157,13 +164,13 @@ unique_developers <- subset_data %>%
 # Create flags for each unique developer
 for (developer in unique_developers) {
   flag_name <- paste0(tolower(gsub("[^[:alnum:]]", "", developer)), "_flag")
-
+  
   # Initialize the column with NAs
   subset_data[[flag_name]] <- NA_integer_
-
+  
   # Set to 1 where the developer appears in any of the columns
   subset_data[[flag_name]][apply(subset_data[developer_columns] == developer, 1, any)] <- 1
-
+  
   # Set to 0 where there are any developers listed, but not the current developer
   subset_data[[flag_name]][apply(!is.na(subset_data[developer_columns]) & subset_data[developer_columns] != developer, 1, any)] <- 0
 }
@@ -213,14 +220,14 @@ qi_columns_to_keep <- c(
   "pi.measure.score.5", "pi.measure.score.6", "pi.measure.score.7",
   "pi.measure.score.8", "pi.measure.score.9", "pi.measure.score.10", "pi.measure.score.11",
   "ia.measure.score.1", "ia.measure.score.2", "ia.measure.score.3",
-  "ia.measure.score.4"
+  "ia.measure.score.4", "pi_cehrt_binary"
 )
 
 # Subset final_data for qi
 subset_data_qi <- subset_data %>%
   select(all_of(qi_columns_to_keep))
 
-# Create Table 1: Overview of all data by rurality
+# Create Table 1: Overview of all data by rurality for QI metrics
 table1_qi <- subset_data_qi %>%
   tbl_summary(by = rural.clinician, missing="no") %>%
   add_overall() %>%
@@ -229,7 +236,6 @@ table1_qi <- subset_data_qi %>%
 print(table1_qi)
 
 table_1_qi_clean <- as_tibble(table1_qi)
-write.csv(table_1_qi_clean, "/path/to/output/directory")
 
 # Subset final_data
 subset_data <- subset_data %>%
@@ -302,72 +308,27 @@ ggpbr_2 <- ggplot(subset_data_percent, aes(x = Rurality, y = Percentage, fill = 
   theme(axis.text.x = element_text(angle = 45, hjust = 1),
         strip.text = element_text(size = 10))
 
+# Supplemental Figure 2
 plot(ggpbr_2)
 
-# Write to csv
+# Write to tibble
 tbl1_tib <- as_tibble(table1)
-write.csv(tbl1_tib, file = "/path/to/output/directory", row.names = FALSE)
 
-# Create Table 2, which subsets by clinician specialty
 
-# Define a function to safely remove the clinician.specialty column (if present)
-safe_remove_column <- function(data, column_name) {
-  if (column_name %in% colnames(data)) {
-    data <- data %>% select(-!!sym(column_name))
-  }
-  return(data)
-}
-
-# Define a function to convert each tbl_summary to a tibble and add specialty column
-convert_to_tibble_with_specialty <- function(tbl, specialty_name) {
-  tbl_tibble <- as_tibble(tbl)
-  tbl_tibble <- safe_remove_column(tbl_tibble, "clinician.specialty") # Safely exclude the clinician.specialty column
-  tbl_tibble$specialty <- specialty_name
-  return(tbl_tibble)
-}
-
-# Create a list of tables for each specialty
-tables_list <- map(selected_specialties, ~ {
-  subset_data %>%
-    filter(clinician.specialty == .x) %>%
-    tbl_summary(by = rural.clinician, missing="no") %>%
-    add_overall()
-})
-
-# Convert each table in tables_list to a tibble with specialty column
-tables_tibble_list <- map2(tables_list, selected_specialties, convert_to_tibble_with_specialty)
-
-# Bind all tibbles together
-combined_table <- bind_rows(tables_tibble_list)
-
-# Convert the tbl_summary object to a tibble
-convert_to_tibble_with_specialty <- function(tbl, specialty) {
-  tibble_output <- as_tibble(tbl) %>%
-    filter(!grepl("clinician.specialty", `**Characteristic**`))
-
-  return(tibble_output)
-}
-
-# Convert each tbl_summary to a tibble and store them in a list
-tables_tibble_list <- map2(tables_list, selected_specialties, convert_to_tibble_with_specialty)
-
-# Combine the tibbles by joining on the "**Characteristic**" column
-tbl2 <- reduce(tables_tibble_list, full_join, by = "**Characteristic**")
-
-write.csv(tbl2, file = "/path/to/output/directory", row.names = FALSE)
+# Create Table 3 that only has clinicians with an EHR
 
 # Subset the data to include only rows where there is a developer
 subset_data1 <- subset_data %>%
   filter(pi_cehrt_binary == 1)
 
-# Create Table 3 that only has clinicians with an EHR
 table3 <- subset_data1 %>%
   tbl_summary(by = rural.clinician) %>%
   add_overall() %>%
   add_p()
 
+print(table3)
+
 tbl3 <- as_tibble(table3)
-write.csv(tbl3, file = "/path/to/output/directory", row.names = FALSE)
 
 # Create Table 4 looking at clinicians by certified EHR status
 table4 <- subset_data %>%
@@ -376,7 +337,6 @@ table4 <- subset_data %>%
   add_p
 
 tbl4 <- as_tibble(table4)
-write.csv(tbl4, file = "/path/to/output/directory", row.names = FALSE)
 
 ###### Part 5: Create visualizations ######
 
@@ -444,29 +404,40 @@ plot(plot)
 
 top_20_developers <- head(developer_frequencies, 20)
 
-# Compute the developer frequencies
+# Compute the developer frequencies for rural clinicians
 developer_frequencies_rural <- subset_data1 %>%
   filter(rural.clinician == 'Rural') %>%
-  select(developer_flags) %>%
+  select(all_of(developer_flags)) %>%
   summarise_all(sum) %>%
   gather(key = "developer_flag", value = "n") %>%
   arrange(-n)
 
-# Compute the developer frequencies
+# Compute the developer frequencies for urban clinicians
 developer_frequencies_not_rural <- subset_data1 %>%
   filter(rural.clinician == 'Urban') %>%
-  select(developer_flags) %>%
+  select(all_of(developer_flags)) %>%
   summarise_all(sum) %>%
   gather(key = "developer_flag", value = "n") %>%
   arrange(-n)
 
-# Calculate total number of sites for rural and non-rural
-total_sites_rural <- sum(developer_frequencies_rural$n)
-total_sites_not_rural <- sum(developer_frequencies_not_rural$n)
+# Calculate total population size
+total_population <- nrow(subset_data1)
 
-# Compute percentage for each developer
-developer_frequencies_rural$percentage <- (developer_frequencies_rural$n / total_sites_rural) * 100
-developer_frequencies_not_rural$percentage <- (developer_frequencies_not_rural$n / total_sites_not_rural) * 100
+# Calculate the number of rural and urban clinicians
+total_rural_population <- subset_data1 %>%
+  filter(rural.clinician == 'Rural') %>%
+  nrow()
+
+total_urban_population <- subset_data1 %>%
+  filter(rural.clinician == 'Urban') %>%
+  nrow()
+
+# Compute percentage for each developer among rural clinicians
+developer_frequencies_rural$percentage <- (developer_frequencies_rural$n / total_rural_population) * 100
+
+# Compute percentage for each developer among urban clinicians
+developer_frequencies_not_rural$percentage <- (developer_frequencies_not_rural$n / total_urban_population) * 100
+
 
 # Relabel the developer flags
 developer_relabels <- c(
@@ -491,38 +462,35 @@ developer_relabels <- c(
 developer_frequencies_rural$developer_flag <- recode(developer_frequencies_rural$developer_flag, !!!developer_relabels)
 developer_frequencies_not_rural$developer_flag <- recode(developer_frequencies_not_rural$developer_flag, !!!developer_relabels)
 
-
 # Replotting the data with bold text and comma-separated count numbers
 plot_rural_updated <- ggplot(head(developer_frequencies_rural, 10),
                              aes(x = reorder(developer_flag, n), y = n, fill = developer_flag)) +
   geom_bar(stat = "identity", show.legend = FALSE) +
-  scale_y_continuous(trans='log2', labels = scales::comma) +
+  scale_y_continuous(trans = 'log2', labels = scales::comma) +
   coord_flip() +
-  labs(title = "Top 10 EHR Vendors for Rural Clinicians",
+  labs(title = "Top 10 EHR Vendors for Physician Participants",
        x = "EHR Vendor",
        y = "Frequency (Log Scale)") +
   theme_minimal() +
-  geom_text(aes(label=sprintf("%s (%.1f%%)", scales::comma(n), percentage)), hjust=1.5, size=3, fontface = "bold")
+  geom_text(aes(label = sprintf("%s (%.1f%%)", scales::comma(n), percentage)), hjust = 1.5, size = 3, fontface = "bold")
 
 plot_not_rural_updated <- ggplot(head(developer_frequencies_not_rural, 10),
                                  aes(x = reorder(developer_flag, n), y = n, fill = developer_flag)) +
   geom_bar(stat = "identity", show.legend = FALSE) +
-  scale_y_continuous(trans='log2', labels = scales::comma) +
+  scale_y_continuous(trans = 'log2', labels = scales::comma) +
   coord_flip() +
-  labs(title = "Top 10 EHR Vendors for Urban Clinicians",
+  labs(title = "Top 10 EHR Vendors for Urban Physician Participants",
        x = "EHR Vendor",
        y = "Frequency (Log Scale)") +
   theme_minimal() +
-  geom_text(aes(label=sprintf("%s (%.1f%%)", scales::comma(n), percentage)), hjust=1.5, size=3, fontface = "bold")
+  geom_text(aes(label = sprintf("%s (%.1f%%)", scales::comma(n), percentage)), hjust = 1.5, size = 3, fontface = "bold")
 
-# Using the Nature color palette from the ggsci package
-library(ggsci)
 plot_rural_updated <- plot_rural_updated + scale_fill_npg()
 plot_not_rural_updated <- plot_not_rural_updated + scale_fill_npg()
 
-# Combine the two plots
+# Combine the two plots, 750 X 1000
+# Figure 1
 grid.arrange(plot_rural_updated, plot_not_rural_updated, ncol = 1)
-
 
 # Create a plot of vendors by subregion by rurality
 
@@ -535,36 +503,18 @@ long_data <- subset_data1 %>%
 
 long_data$developer <- recode(long_data$developer, !!!developer_relabels)
 
-
 # Count occurrences and filter out 'U.S. Territories'
 developer_data <- long_data %>%
   filter(us_census_subregion != "U.S. Territories") %>%
   group_by(us_census_subregion, rural.clinician, developer) %>%
   summarise(count = n())
 
-# Calculate percentages
+# Calculate percentages - Supplemental Table 2
 developer_data <- developer_data %>%
   group_by(us_census_subregion, rural.clinician) %>%
   mutate(total = sum(count), percentage = (count/total) * 100) %>%
   arrange(us_census_subregion, rural.clinician, -percentage) %>%
   slice_head(n = 5)
-
-region_plot <- ggplot(developer_data, aes(x = reorder(developer, percentage), y = percentage, fill = rural.clinician)) +
-  geom_col(position = "dodge", aes(fill = rural.clinician)) +
-  scale_fill_npg(name = "Rurality") +
-  coord_flip() +
-  labs(#title = "Top 5 EHR Developers by Subregion and Rurality",
-    x = "EHR Vendor",
-    y = "Percentage") +
-  facet_wrap(~ us_census_subregion, scales = "free_y", ncol = 2) +
-  theme_minimal() +
-  theme(legend.position="bottom")
-
-print(region_plot)
-
-print(head(developer_data))
-
-write.csv(developer_data, file = "/path/to/output/directory", row.names = FALSE)
 
 # Standardize developer data so that no NULL values are present in the plots
 
@@ -600,43 +550,25 @@ region_plot <- ggplot(full_developer_data, aes(x = reorder(developer, percentage
   theme_minimal() +
   theme(legend.position="bottom")
 
+# Supplemental Figure 3
 print(region_plot)
-
-# Modified plotting code with percentage labels
-region_plot_percentage_label <- ggplot(full_developer_data, aes(x = reorder(developer, percentage), y = percentage, fill = rural.clinician)) +
-  geom_col(position = "dodge", aes(fill = rural.clinician)) +
-  geom_text(aes(label = sprintf("%.1f%%", percentage),
-                y = percentage + 1, # Adjust this value to position the labels appropriately
-                group = rural.clinician),
-            position = position_dodge(width = 1),
-            vjust = -0.25, # Vertical adjustment for label positioning
-            hjust = 0.5,   # Horizontal adjustment for label positioning
-            size = 3,      # Text size, adjust as needed
-            color = "black") +
-  scale_fill_npg(name = "Rurality") +
-  coord_flip() +
-  labs(x = "EHR Vendor", y = "Percentage") +
-  facet_wrap(~ us_census_subregion, scales = "free_y", ncol = 2) +
-  theme_minimal() +
-  theme(legend.position="bottom")
-
-print(region_plot_percentage_label)
-
 
 # Logistic Regression for Certified EHR
 
 # Set Factor Levels
 subset_data$rural.clinician <- factor(subset_data$rural.clinician, levels=c("Urban", "Rural"))
-subset_data$rural.clinician=relevel(as.factor(subset_data$rural.clinician),ref="Urban")
-
 subset_data$clinician.specialty=relevel(as.factor(subset_data$clinician.specialty),ref="Family Practice")
-
 subset_data$us_census_subregion=relevel(as.factor(subset_data$us_census_subregion),ref="East North Central")
 
+# Main Model for certified EHR logistic regression
+MV_model_cehrt <- glm(pi_cehrt_binary ~ rural.clinician + extreme.hardship + small.practitioner +
+            facility.based + hospital.based.clinician + hpsa.clinician + 
+            years.in.medicare + clinician.specialty + us_census_subregion, 
+          family = binomial, data = subset_data)
 
-m12 <- glm(pi_cehrt_binary ~ rural.clinician, family = binomial, data = subset_data)
-m1_univariable <- m12 %>%
-  tbl_regression(exponentiate = TRUE)   %>%
+# Exponentiate and clean results with tbl_summary()
+MV_model_cehrt_exp <- MV_model_cehrt %>%
+  tbl_regression(exponentiate = TRUE) %>%
   add_nevent(location = "level") %>%
   add_n(location = "level") %>%
   # adding event rate
@@ -652,24 +584,70 @@ m1_univariable <- m12 %>%
         .after = stat_nevent
       )
   ) %>%
-  # merge the colums into a single column
-  modify_cols_merge(
+  # merge the columns into a single column
+  modify_column_merge(
     pattern = "{stat_nevent} / {stat_n} ({stat_nevent_rate})",
     rows = !is.na(stat_nevent)
   ) %>%
   # update header to event rate
   modify_header(stat_nevent = "**Event Rate**")
 
-print(m1_univariable)
+print(MV_model_cehrt_exp)
 
+MV_model_cehrt_exp_tibble <- as_tibble(MV_model_cehrt_exp)
 
-m1 <- glm(pi_cehrt_binary ~ rural.clinician + years.in.medicare + clinician.specialty +
-             small.practitioner + hpsa.clinician  + hospital.based.clinician +
-             facility.based + clinician.specialty + extreme.hardship +
-             us_census_subregion, family = binomial, data = subset_data)
+# Figure 2 
+plot_glm_all <- ggcoef_table(
+  MV_model_cehrt,
+  exponentiate = TRUE,
+  errorbar = TRUE,
+  errorbar_coloured = TRUE,
+  add_reference_rows = FALSE,
+  table_witdhs = c(3, 1),
+  categorical_terms_pattern = "{level} (ref: {reference_level})",
+  ci_pattern = "{estimate} ({conf.low}-{conf.high})",
+  table_stat = c("ci"),
+  table_header = "Odds Ratios (95% CI)",
+  table_stat_label = list(
+    estimate = scales::label_number(accuracy = .01),
+    conf.low = scales::label_number(accuracy = .01),
+    conf.high = scales::label_number(accuracy = .01)
+  ),
+  include = c(
+    "rural.clinician",
+    "extreme.hardship",
+    "small.practitioner",
+    "facility.based",
+    "hospital.based.clinician",
+    "hpsa.clinician",
+    "years.in.medicare",
+    "us_census_subregion"),
+  variable_labels = c(
+    rural.clinician = "Rurality",
+    extreme.hardship = "Extreme Hardship",
+    small.practitioner = "Small Practitioner",
+    facility.based = "Facility Based",
+    hospital.based.clinician = "Hospital Based",
+    hpsa.clinician = "HPSA Clinician",
+    years.in.medicare = "Years in Medicare",
+    us_census_subregion = "Census Division")
+)
 
-m1_multivariable <- m1 %>%
-  tbl_regression(exponentiate = TRUE)   %>%
+# Filter data for "Rural" 
+subset_r <- subset_data %>%
+  filter(rural.clinician == "Rural")
+
+# Filter data for "Urban" 
+subset_u <- subset_data %>%
+  filter(rural.clinician == "Urban")
+
+m_all_r <- glm(pi_cehrt_binary ~ extreme.hardship + small.practitioner +
+                 facility.based + hospital.based.clinician + hpsa.clinician + 
+                 years.in.medicare + clinician.specialty + us_census_subregion, 
+               family = binomial, data = subset_r) 
+
+m_all_r_clean <- m_all_r %>%
+  tbl_regression(exponentiate = TRUE) %>%
   add_nevent(location = "level") %>%
   add_n(location = "level") %>%
   # adding event rate
@@ -685,105 +663,57 @@ m1_multivariable <- m1 %>%
         .after = stat_nevent
       )
   ) %>%
-  # merge the colums into a single column
-  modify_cols_merge(
+  # merge the columns into a single column
+  modify_column_merge(
     pattern = "{stat_nevent} / {stat_n} ({stat_nevent_rate})",
     rows = !is.na(stat_nevent)
   ) %>%
   # update header to event rate
   modify_header(stat_nevent = "**Event Rate**")
-
-print(m1_multivariable)
-
-
-subset_r <- subset_data %>% filter(rural.clinician == "Rural")
-
-subset_u <- subset_data %>% filter(rural.clinician == "Urban")
-
-m_all_r <- glm(pi_cehrt_binary ~ facility.based + hospital.based.clinician + years.in.medicare + clinician.specialty + hpsa.clinician + us_census_subregion + small.practitioner + extreme.hardship, family = binomial, data = subset_r) %>%
-  tbl_regression(exponentiate = TRUE)
-
-m_all_rural <- glm(pi_cehrt_binary ~ extreme.hardship + small.practitioner + facility.based + hospital.based.clinician + hpsa.clinician + years.in.medicare + clinician.specialty + us_census_subregion, family = binomial, data = subset_r)
-
-subset_r$extreme.hardship <- factor(subset_r$extreme.hardship, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_r$small.practitioner <- factor(subset_r$small.practitioner, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_r$facility.based <- factor(subset_r$facility.based, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_r$hospital.based.clinician <- factor(subset_r$hospital.based.clinician, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_r$hpsa.clinician <- factor(subset_r$hpsa.clinician, levels = c(0, 1), labels = c('No', 'Yes'))
-
-m_all_rural_ts <- glm(pi_cehrt_binary ~ as.factor(extreme.hardship) + as.factor(small.practitioner) + as.factor(facility.based) + as.factor(hospital.based.clinician) + as.factor(hpsa.clinician) + years.in.medicare + clinician.specialty + us_census_subregion, family = binomial, data = subset_r)
-
-m_all_rural_tbl <- m_all7_rural_ts %>%
-  tbl_regression(exponentiate = TRUE)   %>%
-  add_nevent(location = "level") %>%
-  add_n(location = "level") %>%
-  # adding event rate
-  modify_table_body(
-    ~ .x %>%
-      dplyr::mutate(
-        stat_nevent_rate =
-          ifelse(
-            !is.na(stat_nevent),
-            paste0(style_sigfig(stat_nevent / stat_n, scale = 100), "%"),
-            NA
-          ),
-        .after = stat_nevent
-      )
-  ) %>%
-  # merge the colums into a single column
-  modify_cols_merge(
-    pattern = "{stat_nevent} / {stat_n} ({stat_nevent_rate})",
-    rows = !is.na(stat_nevent)
-  ) %>%
-  # update header to event rate
-  modify_header(stat_nevent = "**Event Rate**")
-
-m_all_rural_tbl <- as_tibble(m_all7_rural_tbl)
-write.csv(m_all7_rural_tbl, "/path/to/output/directory")
 
 plot_glm_rural <- ggcoef_table(
-  m_all_rural,
+  m_all_r,
   exponentiate = TRUE,
   errorbar = TRUE,
-  errorbar_height = 0,
   errorbar_coloured = TRUE,
+  add_reference_rows = FALSE,
+  table_witdhs = c(3, 1),
+  categorical_terms_pattern = "{level} (ref: {reference_level})",
+  ci_pattern = "{estimate} ({conf.low}-{conf.high})",
+  table_stat = c("ci"),
+  table_header = "Odds Ratios (95% CI)",
+  table_stat_label = list(
+    estimate = scales::label_number(accuracy = .01),
+    conf.low = scales::label_number(accuracy = .01),
+    conf.high = scales::label_number(accuracy = .01)
+  ),
   include = c(
     "extreme.hardship",
-    "practice.size",
     "small.practitioner",
-    "hpsa.clinician",
-    "hospital.based.clinician",
     "facility.based",
+    "hospital.based.clinician",
+    "hpsa.clinician",
     "years.in.medicare",
-    "medicare.patients",
     "us_census_subregion"),
   variable_labels = c(
     extreme.hardship = "Extreme Hardship",
     small.practitioner = "Small Practitioner",
-    practice.size = "Practice Size",
-    hpsa.clinician = "HPSA Clinician",
     facility.based = "Facility Based",
     hospital.based.clinician = "Hospital Based",
+    hpsa.clinician = "HPSA Clinician",
     years.in.medicare = "Years in Medicare",
-    medicare.patients = "Number of Medicare Patients",
-    us_census_subregion = "Census Subregion")
+    us_census_subregion = "Census Division")
 )
 
-plot(plot_glm_rural) + scale_color_npg()
+plot(plot_glm_rural) 
 
-m_all_urban <- glm(pi_cehrt_binary ~ extreme.hardship + small.practitioner + facility.based + hospital.based.clinician + hpsa.clinician + years.in.medicare + clinician.specialty + us_census_subregion , family = binomial, data = subset_u)
+m_all_u <- glm(pi_cehrt_binary ~ extreme.hardship + small.practitioner +
+                 facility.based + hospital.based.clinician + hpsa.clinician + 
+                 years.in.medicare + clinician.specialty + us_census_subregion, 
+               family = binomial, data = subset_u) 
 
-subset_u$extreme.hardship <- factor(subset_u$extreme.hardship, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_u$small.practitioner <- factor(subset_u$small.practitioner, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_u$facility.based <- factor(subset_u$facility.based, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_u$hospital.based.clinician <- factor(subset_u$hospital.based.clinician, levels = c(0, 1), labels = c('No', 'Yes'))
-subset_u$hpsa.clinician <- factor(subset_u$hpsa.clinician, levels = c(0, 1), labels = c('No', 'Yes'))
-
-m_all_urban_ts <- glm(pi_cehrt_binary ~ extreme.hardship + small.practitioner + facility.based + hospital.based.clinician + hpsa.clinician + years.in.medicare + clinician.specialty + us_census_subregion , family = binomial, data = subset_u)
-
-
-m_all_urban_tbl <- m_all_urban_ts %>%
-  tbl_regression(exponentiate = TRUE)   %>%
+m_all_u_clean <- m_all_u %>%
+  tbl_regression(exponentiate = TRUE) %>%
   add_nevent(location = "level") %>%
   add_n(location = "level") %>%
   # adding event rate
@@ -799,54 +729,58 @@ m_all_urban_tbl <- m_all_urban_ts %>%
         .after = stat_nevent
       )
   ) %>%
-  # merge the colums into a single column
-  modify_cols_merge(
+  # merge the columns into a single column
+  modify_column_merge(
     pattern = "{stat_nevent} / {stat_n} ({stat_nevent_rate})",
     rows = !is.na(stat_nevent)
   ) %>%
   # update header to event rate
   modify_header(stat_nevent = "**Event Rate**")
 
-m_all_urban_tbl <- as_tibble(m_all_urban_tbl)
-write.csv(m_all_urban_tbl, "/path/to/output/directory")
-
-
 plot_glm_urban <- ggcoef_table(
-  m_all_urban,
+  m_all_u,
   exponentiate = TRUE,
   errorbar = TRUE,
-  errorbar_height = 0,
   errorbar_coloured = TRUE,
+  add_reference_rows = FALSE,
+  table_witdhs = c(3, 1),
+  categorical_terms_pattern = "{level} (ref: {reference_level})",
+  ci_pattern = "{estimate} ({conf.low}-{conf.high})",
+  table_stat = c("ci"),
+  table_header = "Odds Ratios (95% CI)",
+  table_stat_label = list(
+    estimate = scales::label_number(accuracy = .01),
+    conf.low = scales::label_number(accuracy = .01),
+    conf.high = scales::label_number(accuracy = .01)
+  ),
   include = c(
     "extreme.hardship",
-    "practice.size",
     "small.practitioner",
-    "hpsa.clinician",
-    "hospital.based.clinician",
     "facility.based",
+    "hospital.based.clinician",
+    "hpsa.clinician",
     "years.in.medicare",
-    "medicare.patients",
     "us_census_subregion"),
   variable_labels = c(
     extreme.hardship = "Extreme Hardship",
     small.practitioner = "Small Practitioner",
-    practice.size = "Practice Size",
-    hpsa.clinician = "HPSA Clinician",
     facility.based = "Facility Based",
     hospital.based.clinician = "Hospital Based",
+    hpsa.clinician = "HPSA Clinician",
     years.in.medicare = "Years in Medicare",
-    medicare.patients = "Number of Medicare Patients",
-    us_census_subregion = "Census Subregion")
+    us_census_subregion = "Census Division")
 )
 
+plot(plot_glm_urban) 
+
+
 models2 <- list(
-  "Urban Participants" = m_all_urban,
-  "Rural Participants" = m_all_rural
+  "Urban Participants" = m_all_u,
+  "Rural Participants" = m_all_r
 )
 
 glm_compared <- ggcoef_compare(models2,
                                type = "faceted",
-                               #errorbar_height = 0,
                                errorbar_coloured = TRUE,
                                add_reference_rows = FALSE,
                                exponentiate = TRUE,
@@ -868,22 +802,9 @@ glm_compared <- ggcoef_compare(models2,
                                  years.in.medicare = "Years in Medicare",
                                  us_census_subregion = "Census Subregion"))
 
-# 1000 x 750 pixels
-plot(glm_compared)  + scale_color_npg()
+# 1000 x 750 pixels - Figure 3
+plot(glm_compared)
 
-plot(plot_glm_urban)
-
-m_all_r_tibble <- as_tibble(m_all_r)
-write.csv(m_all_r_tibble, file = "/path/to/output/directory", row.names = FALSE)
-
-m_all_u <- glm(pi_cehrt_binary ~ extreme.hardship + practice.size + years.in.medicare +
-                  medicare.patients + small.practitioner  + hospital.based.clinician +
-                  clinician.specialty + hpsa.clinician +  facility.based +
-                  us_census_subregion, family = binomial, data = subset_u)%>%
-  tbl_regression(exponentiate = TRUE)
-
-m_all_u_tibble <- as_tibble(m_all_u)
-write.csv(m_all7_u_tibble, file = "/path/to/output/directory", row.names = FALSE)
 
 # Linear regrssion for PIS
 subset_data <- subset_data %>%
@@ -902,6 +823,7 @@ lm1 <- lm(promoting_interoperability ~ rural.clinician + practice.size + years.i
             medicare.patients +
             clinician.specialty +  us_census_subregion, data = subset_data)
 
+# Figure 5
 plot_lm_all <- ggcoef_table(
   lm_all,
   errorbar = TRUE,
@@ -939,53 +861,7 @@ plot_lm_all <- ggcoef_table(
 
 plot(plot_lm_all)
 
-lm2 <- lm(promoting_interoperability ~ rural.clinician*extreme.hardship + practice.size + years.in.medicare +
-            medicare.patients + small.practitioner  + hospital.based.clinician +
-            clinician.specialty + hpsa.clinician +  facility.based +
-            us_census_subregion, data = subset_data)
-
-lm2_tib <- lm2 %>%  tbl_regression()
-
-lm2_tib <- as_tibble(lm2_tib)
-
-write.csv(lm2_tib, file = "/path/to/output/directory", row.names = FALSE)
-
-print(lm2_tib)
-
-plot_lm2 <- ggcoef_table(
-  lm2,
-  errorbar = TRUE,
-  errorbar_height = 0,
-  errorbar_coloured = TRUE,
-  include = c(
-    "rural.clinician",
-    "extreme.hardship",
-    "practice.size",
-    "years.in.medicare",
-    "medicare.patients",
-    "small.practitioner",
-    "hpsa.clinician",
-    "hospital.based.clinician",
-    "facility.based",
-    "us_census_subregion"),
-  variable_labels = c(
-    rural.clinician = "Rurality",
-    extreme.hardship = "Extreme Hardship",
-    small.practitioner = "Small Practitioner",
-    practice.size = "Practice Size",
-    facility.based = "Facility-Based",
-    hpsa.clinician = "HPSA",
-    hospital.based.clinician = "Hospital-Based",
-    years.in.medicare = "Years in Medicare",
-    medicare.patients = "Number of Medicare Patients",
-    us_census_subregion = "Census Subregion"))
-
-plot(plot_lm2)
-
-subset_r <- subset_data %>% filter(rural.clinician == "Rural")
-
-subset_u <- subset_data %>% filter(rural.clinician == "Urban")
-
+# Stratified models by rurality
 lm2_urban <- lm(promoting_interoperability ~ extreme.hardship + practice.size + years.in.medicare +
                   medicare.patients + small.practitioner  + hospital.based.clinician +
                   clinician.specialty + hpsa.clinician +  facility.based +
@@ -1007,13 +883,12 @@ merged_lm_strat <-
 
 merged_lm_strat <- as_tibble(merged_lm_strat)
 
-write.csv(merged_lm_strat, file = "/path/to/output/directory", row.names = FALSE)
-
 models <- list(
   "Urban Participants" = lm2_urban,
   "Rural Participants" = lm2_rural
 )
 
+# Supplemental Table 4
 lm_compared <- ggcoef_compare(models,
                               type = "faceted",
                               include = c(
@@ -1074,7 +949,7 @@ ggcoef_table <- function(
     plot_title = NULL,
     ...) {
   args <- list(...)
-
+  
   # undocumented feature, we can pass directly `data`
   # used by ggcoef_multicomponents()
   if (is.null(args$data)) {
@@ -1104,7 +979,7 @@ ggcoef_table <- function(
   } else {
     data <- args$data
   }
-
+  
   if (show_p_values && signif_stars) {
     data$add_to_label <- paste0(data$p_value_label, data$signif_stars)
   }
@@ -1114,7 +989,7 @@ ggcoef_table <- function(
   if (!show_p_values && signif_stars) {
     data$add_to_label <- data$signif_stars
   }
-
+  
   if (show_p_values || signif_stars) {
     data$label <- forcats::fct_inorder(
       factor(
@@ -1141,29 +1016,29 @@ ggcoef_table <- function(
       )
     )
   }
-
+  
   args$data <- data
   args$exponentiate <- exponentiate
-
+  
   if (!"y" %in% names(args) && !"facet_row" %in% names(args)) {
     args$y <- "label_light"
   }
-
+  
   if (!"colour" %in% names(args) && !all(is.na(data$var_label))) {
     args$colour <- "var_label"
     if (!"colour_guide" %in% names(args)) {
       args$colour_guide <- FALSE
     }
   }
-
+  
   if (!"y" %in% names(args)) args$y <- "label"
   if (!"facet_row" %in% names(args)) args$facet_row <- "var_label"
   if (!"stripped_rows" %in% names(args)) args$stripped_rows <- TRUE
   if (!"strips_odd" %in% names(args)) args$strips_odd <- "#11111111"
   if (!"strips_even" %in% names(args)) args$strips_even <- "#00000000"
-
+  
   coef_plot <- do.call(ggcoef_plot, args)
-
+  
   if (!is.null(plot_title)) {
     coef_plot <- coef_plot +
       ggplot2::ggtitle(plot_title) +
@@ -1172,7 +1047,7 @@ ggcoef_table <- function(
         plot.title.position = "plot"
       )
   }
-
+  
   if (args$stripped_rows) {
     if (!"term" %in% names(data)) {
       data$term <- data[[args$y]]
@@ -1184,10 +1059,10 @@ ggcoef_table <- function(
         args$strips_odd
       ))
   }
-
+  
   # building the coefficient table ----
   tbl_data <- data
-
+  
   if (!"estimate" %in% names(table_stat_label)) {
     table_stat_label$estimate <- scales::label_number(accuracy = .01)
   }
@@ -1204,7 +1079,7 @@ ggcoef_table <- function(
     tbl_data[[v]] <- table_stat_label[[v]](tbl_data[[v]])
     tbl_data[[v]][is.na(tbl_data[[v]])] <- ""
   }
-
+  
   tbl_data$ci <- stringr::str_glue_data(tbl_data, ci_pattern)
   tbl_data$ci[is.na(data$conf.low) & is.na(data$conf.high)] <- " "
   tbl_data <- tbl_data %>%
@@ -1215,11 +1090,11 @@ ggcoef_table <- function(
       values_transform = as.character
     )
   tbl_data$stat <- factor(tbl_data$stat, levels = table_stat)
-
+  
   if (!is.null(table_header) && length(table_header) != length(table_stat)) {
     cli::cli_abort("{.arg table_header} should have the same length as {.arg table_stat}.") # nolint
   }
-
+  
   if (is.null(table_header)) {
     table_header <- table_stat
     if ("estimate" %in% table_header) {
@@ -1234,7 +1109,7 @@ ggcoef_table <- function(
       table_header[table_header == "p.value"] <- "p"
     }
   }
-
+  
   table_plot <- ggplot2::ggplot(tbl_data) +
     ggplot2::aes(
       x = .data[["stat"]],
@@ -1260,7 +1135,7 @@ ggcoef_table <- function(
       panel.grid = ggplot2::element_blank(),
       axis.ticks = ggplot2::element_blank()
     )
-
+  
   if (args$stripped_rows) {
     table_plot <- table_plot +
       geom_stripped_rows(
@@ -1270,7 +1145,7 @@ ggcoef_table <- function(
         )
       )
   }
-
+  
   # join the plots
   patchwork::wrap_plots(coef_plot, table_plot, nrow = 1, widths = table_witdhs)
 }
@@ -1300,11 +1175,11 @@ ggcoef_data <- function(
     significance = conf.level,
     significance_labels = NULL) {
   rlang::check_installed("broom.helpers")
-
+  
   if (length(significance) == 0) {
     significance <- NULL
   }
-
+  
   data <- rlang::inject(broom.helpers::tidy_plus_plus(
     model = model,
     tidy_fun = tidy_fun,
@@ -1329,12 +1204,12 @@ ggcoef_data <- function(
     keep_model = FALSE,
     !!!tidy_args
   ))
-
+  
   if (!"p.value" %in% names(data)) {
     data$p.value <- NA_real_
     significance <- NULL
   }
-
+  
   if (!is.null(significance)) {
     if (is.null(significance_labels)) {
       significance_labels <- paste(c("p \u2264", "p >"), significance)
@@ -1345,22 +1220,22 @@ ggcoef_data <- function(
       labels = significance_labels
     )
   }
-
+  
   data$signif_stars <- signif_stars(data$p.value, point = NULL)
-
+  
   data$p_value_label <- ifelse(
     is.na(data$p.value),
     "",
     scales::pvalue(data$p.value, add_p = TRUE)
   )
-
+  
   data <- data[!is.na(data$estimate), ]
-
+  
   data$term <- .in_order(data$term)
   data$var_label <- .in_order(data$var_label)
   data$variable <- .in_order(data$variable)
   data$label <- .in_order(data$label)
-
+  
   data$label_light <- dplyr::if_else(
     as.character(data$label) == as.character(data$var_label) &
       ((!grepl("^nmatrix", data$var_class)) | is.na(data$var_class)),
@@ -1368,7 +1243,7 @@ ggcoef_data <- function(
     as.character(data$label)
   ) %>%
     .in_order()
-
+  
   data
 }
 
@@ -1380,7 +1255,7 @@ ggcoef_data <- function(
 ##### Figure 4 Code #####
 
 # Load the RUCC data, which is available here: https://www.ers.usda.gov/data-products/rural-urban-continuum-codes.aspx
-rucc_data <- read.csv('/path/to/ruca/file')
+rucc_data <- read.csv('/path/to/rucc/file')
 
 # Ensure FIPS codes have leading zeros and are character type
 rucc_data <- rucc_data %>%
@@ -1476,7 +1351,7 @@ create_combined_map_with_colors <- function(data, avg_data, title, state_boundar
   data <- data %>%
     left_join(avg_data, by = c("us_census_subregion" = "us_census_subregion", "category" = "rural.clinician")) %>%
     mutate(color_category = ifelse(category == "Urban", "Urban", "Rural"))
-
+  
   ggplot() +
     geom_sf(data = data, aes(fill = avg_pi_score), color = NA) +
     geom_sf(data = state_boundaries, fill = NA, color = "black", size = 0.2) +
@@ -1496,5 +1371,5 @@ combined_map_with_colors <- create_combined_map_with_colors(map_data, avg_pi_sco
                                                             "Combined Urban and Rural Counties - Promoting Interoperability Score by Census Division",
                                                             state_boundaries, subregion_boundaries, min_pi_score, max_pi_score)
 
-# Print the combined map
+# Figure 4
 print(combined_map_with_colors)
